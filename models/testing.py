@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from device_utils import get_preferred_device
 import plotly.graph_objects as go
 import math
 import numpy as np
@@ -99,7 +100,7 @@ class ShapeSDF(nn.Module):
         Args:
             inputs: batch_size X 3
         """
-        dummy_feats = torch.zeros((inputs.size()[0], 1)).cuda()
+        dummy_feats = torch.zeros((inputs.size()[0], 1), device=inputs.device if inputs.is_cuda else get_preferred_device())
         sdf_vals = self.sdf_func(inputs, self.parameter)
         return torch.cat([sdf_vals, dummy_feats], dim=-1)
 
@@ -171,7 +172,7 @@ class ConstVar(nn.Module):
     def forward(self, pts):
         return torch.tensor(
             [[math.exp(10 * self.variance)]]
-        ).cuda()  # previously had sign error here, be careful
+        ).to(pts.device if pts.is_cuda else get_preferred_device())  # previously had sign error here, be careful
     
 def plot_mesh(mesh, fig):
     """

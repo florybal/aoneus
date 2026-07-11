@@ -4,6 +4,9 @@ import torch.nn.functional as F
 import numpy as np
 from models.embedder import get_embedder
 import sys
+from torch.nn.utils.parametrizations import weight_norm as torch_weight_norm
+
+device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 
 # This implementation is borrowed from IDR: https://github.com/lioryariv/idr
 class SDFNetwork(nn.Module):
@@ -18,8 +21,11 @@ class SDFNetwork(nn.Module):
                  scale=1,
                  geometric_init=True,
                  weight_norm=True,
-                 inside_outside=False):
+                 inside_outside=False, 
+                 init_val=0.0):
         super(SDFNetwork, self).__init__()
+        
+        self.variance = nn.Parameter(torch.tensor(init_val))
 
         dims = [d_in] + [d_hidden for _ in range(n_layers)] + [d_out]
 
@@ -45,10 +51,10 @@ class SDFNetwork(nn.Module):
             if geometric_init:
                 if l == self.num_layers - 2:
                     if not inside_outside:
-                        torch.nn.init.normal_(lin.weight, mean= np.sqrt(np.pi) / np.sqrt(dims[l]), std=0.0001)
+                        torch.nn.init.normal_(lin.weight, mean=np.sqrt(np.pi) / np.sqrt(dims[l]), std=0.0001)
                         torch.nn.init.constant_(lin.bias, -bias)
                     else:
-                        torch.nn.init.normal_(lin.weight, mean= -np.sqrt(np.pi) / np.sqrt(dims[l]), std=0.0001)
+                        torch.nn.init.normal_(lin.weight, mean=-np.sqrt(np.pi) / np.sqrt(dims[l]), std=0.0001)
                         torch.nn.init.constant_(lin.bias, bias)
                 elif multires > 0 and l == 0:
                     torch.nn.init.constant_(lin.bias, 0.0)
@@ -63,31 +69,52 @@ class SDFNetwork(nn.Module):
                     torch.nn.init.normal_(lin.weight, 0.0, np.sqrt(2) / np.sqrt(out_dim))
 
             if weight_norm:
-                lin = nn.utils.weight_norm(lin)
+                #print("weight_norm disabled")
+                lin = torch_weight_norm(lin)
+                
 
             setattr(self, "lin" + str(l), lin)
 
         self.activation = nn.Softplus(beta=100)
 
     def forward(self, inputs):
+
+        target_device = self.lin0.weight.device
+
+        inputs = inputs.to(target_device)
+
+
         inputs = inputs * self.scale
+
         if self.embed_fn_fine is not None:
             inputs = self.embed_fn_fine(inputs)
+            #print("AFTER EMBED:", inputs.device)
 
         x = inputs
+
         for l in range(0, self.num_layers - 1):
+
             lin = getattr(self, "lin" + str(l))
 
+            x = x.to(lin.weight.device)
+
             if l in self.skip_in:
-                x = torch.cat([x, inputs], 1) / np.sqrt(2)
-            
+                x = torch.cat(
+                    [x, inputs.to(x.device)],
+                    dim=1
+                ) / np.sqrt(2)
+
             x = lin(x)
 
             if l < self.num_layers - 2:
                 x = self.activation(x)
-        return torch.cat([x[:, :1] / self.scale, x[:, 1:]], dim=-1)
 
+
+        return x
+        
     def sdf(self, x):
+        target_device = self.lin0.weight.device
+        x = x.to(target_device)
         return self.forward(x)[:, :1]
 
     def sdf_hidden_appearance(self, x):
@@ -95,82 +122,109 @@ class SDFNetwork(nn.Module):
 
     def gradient(self, x):
         x.requires_grad_(True)
+
         y = self.sdf(x)
-        d_output = torch.ones_like(y, requires_grad=False, device=y.device)
+
+        d_output = torch.ones_like(
+            y,
+            requires_grad=False,
+            device=y.device
+        )
+
         gradients = torch.autograd.grad(
             outputs=y,
             inputs=x,
             grad_outputs=d_output,
             create_graph=True,
             retain_graph=True,
-            only_inputs=True)[0]
-        return gradients.unsqueeze(1)
+            only_inputs=True,
+            allow_unused=True
+        )[0]
 
+        if gradients is None:
+            gradients = torch.zeros_like(x)
+
+        return gradients.unsqueeze(1)
 
 # This implementation is borrowed from IDR: https://github.com/lioryariv/idr
 class RenderingNetwork(nn.Module):
-    def __init__(self,
-                 d_feature,
-                 mode,
-                 d_in,
-                 d_out,
-                 d_hidden,
-                 n_layers,
-                 weight_norm=True,
-                 multires_view=0,
-                 squeeze_out=True):
+    def __init__(self, d_in, d_out, d_hidden, n_layers, multires=0, multires_view=0, squeeze_out=True, mode='idr', **kwargs):
         super().__init__()
-
-        self.mode = mode
+        self.d_out = d_out
+        self.d_hidden = d_hidden
+        self.n_layers = n_layers
         self.squeeze_out = squeeze_out
-        dims = [d_in + d_feature] + [d_hidden for _ in range(n_layers)] + [d_out]
+        self.mode = mode
 
-        self.embedview_fn = None
+        # Corrigido: extrai a função da tupla retornada por get_embedder
+        if multires > 0:
+            embed_fn, _ = get_embedder(multires)
+            self.embed_fn = embed_fn
+        else:
+            self.embed_fn = None
+
         if multires_view > 0:
-            embedview_fn, input_ch = get_embedder(multires_view)
+            embedview_fn, _ = get_embedder(multires_view)
             self.embedview_fn = embedview_fn
-            dims[0] += (input_ch - 3)
+        else:
+            self.embedview_fn = None
 
-        self.num_layers = len(dims)
+        self.linears = None
 
-        for l in range(0, self.num_layers - 1):
-            out_dim = dims[l + 1]
-            lin = nn.Linear(dims[l], out_dim)
-
-            if weight_norm:
-                lin = nn.utils.weight_norm(lin)
-
-            setattr(self, "lin" + str(l), lin)
-
-        self.relu = nn.ReLU()
-
-    def forward(self, points, normals, view_dirs, feature_vectors):
-        if self.embedview_fn is not None:
+    def forward(self, points, normals=None, view_dirs=None, feature_vectors=None):
+        if self.embed_fn is not None:
+            points = self.embed_fn(points)
+        if self.embedview_fn is not None and view_dirs is not None:
             view_dirs = self.embedview_fn(view_dirs)
+        if self.embedview_fn is not None and normals is not None:
+            normals = self.embedview_fn(normals)
 
-        rendering_input = None
-
+        feats = [points]
         if self.mode == 'idr':
-            rendering_input = torch.cat([points, view_dirs, normals, feature_vectors], dim=-1)
+            if view_dirs is not None:
+                feats.append(view_dirs)
+            if normals is not None:
+                feats.append(normals)
+            if feature_vectors is not None:
+                feats.append(feature_vectors)
         elif self.mode == 'no_view_dir':
-            rendering_input = torch.cat([points, normals, feature_vectors], dim=-1)
+            if normals is not None:
+                feats.append(normals)
+            if feature_vectors is not None:
+                feats.append(feature_vectors)
         elif self.mode == 'no_normal':
-            rendering_input = torch.cat([points, view_dirs, feature_vectors], dim=-1)
+            if view_dirs is not None:
+                feats.append(view_dirs)
+            if feature_vectors is not None:
+                feats.append(feature_vectors)
+        else:
+            for t in (view_dirs, normals, feature_vectors):
+                if t is not None:
+                    feats.append(t)
+
+        rendering_input = torch.cat(feats, dim=-1)
+        actual_d_in = rendering_input.shape[-1]
+
+        if self.linears is None:
+            dims = [actual_d_in] + [self.d_hidden] * self.n_layers + [self.d_out]
+            self.linears = nn.ModuleList()
+            for i in range(len(dims)-1):
+                lin = nn.Linear(dims[i], dims[i+1])
+                nn.init.xavier_uniform_(lin.weight)
+                nn.init.zeros_(lin.bias)
+                self.linears.append(lin)
+            self.linears.to(rendering_input.device)
 
         x = rendering_input
-
-        for l in range(0, self.num_layers - 1):
-            lin = getattr(self, "lin" + str(l))
-
+        for lin in self.linears[:-1]:
             x = lin(x)
-
-            if l < self.num_layers - 2:
-                x = self.relu(x)
-
+            x = F.relu(x)
+        x = self.linears[-1](x)
         if self.squeeze_out:
             x = torch.sigmoid(x)
         return x
-
+   
+   
 
 # This implementation is borrowed from nerf-pytorch: https://github.com/yenchenlin/nerf-pytorch
 class NeRF(nn.Module):
@@ -256,8 +310,8 @@ class NeRF(nn.Module):
 
 class SingleVarianceNetwork(nn.Module):
     def __init__(self, init_val):
-        super(SingleVarianceNetwork, self).__init__()
-        self.register_parameter('variance', nn.Parameter(torch.tensor(init_val)))
+        super().__init__()
+        self.variance = nn.Parameter(torch.tensor(init_val))
 
     def forward(self, x):
-        return torch.ones([len(x), 1]) * torch.exp(self.variance * 10.0)
+        return torch.ones([len(x), 1], device=self.variance.device) * torch.exp(self.variance * 10.0)

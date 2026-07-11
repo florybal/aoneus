@@ -4,6 +4,7 @@ import numpy as np
 
 # matplotlib.use("Agg")
 from MLP import *
+from device_utils import get_preferred_device
 
 
 torch.autograd.set_detect_anomaly(True)
@@ -40,7 +41,8 @@ def render_image(neusis_runner, pose_ind, estimator=None, debug=False):
     px = px.reshape(-1, 2).long() # int conversion needed 
 
 
-    c2w = torch.from_numpy(neusis_runner.data["sensor_poses"][pose_ind]).cuda()
+    device = neusis_runner.device if hasattr(neusis_runner, "device") else get_preferred_device()
+    c2w = torch.from_numpy(neusis_runner.data["sensor_poses"][pose_ind]).to(dirs.device)
     r_min = neusis_runner.r_min
     r_max = neusis_runner.r_max
     n_selected_px = H * W
@@ -52,10 +54,10 @@ def render_image(neusis_runner, pose_ind, estimator=None, debug=False):
     # print(sonar_resolution)
     for i in range(H):
         r_increments.append(i * sonar_resolution + r_min)
-    r_increments = torch.tensor(r_increments).cuda()
+    r_increments = torch.tensor(r_increments, device=device)
     randomize_points = False
     device = "cuda:0"
-    cube_center = neusis_runner.cube_center.cuda()
+    cube_center = neusis_runner.cube_center.to(device)
 
     dirs, dphi, r, rs, pts_r_rand, dists = get_arcs(
         H,
@@ -135,10 +137,10 @@ def get_arcs(
         .float()
         .repeat(n_selected_px)
         .reshape(n_selected_px, -1)
-    )
+    ).to(device)
 
     dphi = (phi_max - phi_min) / arc_n_samples
-    rnd = -dphi + torch.rand(n_selected_px, arc_n_samples) * 2 * dphi
+    rnd = -dphi + torch.rand(n_selected_px, arc_n_samples, device=device) * 2 * dphi
 
     sonar_resolution = (r_max - r_min) / H
     if randomize_points:
@@ -159,7 +161,7 @@ def get_arcs(
             phi,
         ),
         dim=-1,
-    )
+    ).to(device)
     coords = coords.reshape(-1, 3)
     # Transform to cartesian to apply pose transformation and get the direction
     # transformation as described in https://www.ri.cmu.edu/pub_files/2016/5/thuang_mastersthesis.pdf
@@ -169,7 +171,7 @@ def get_arcs(
 
     dirs = torch.stack((X, Y, Z, torch.ones_like(X))).T
     dirs = torch.matmul(c2w, dirs.T).T
-    origin = torch.matmul(c2w, torch.tensor([0.0, 0.0, 0.0, 1.0])).unsqueeze(dim=0)
+    origin = torch.matmul(c2w, torch.tensor([0.0, 0.0, 0.0, 1.0], dtype=torch.float32, device=device)).unsqueeze(dim=0)    
     dirs = dirs - origin
     dirs = dirs[:, 0:3]
     dirs = torch.nn.functional.normalize(dirs, dim=1)
@@ -201,7 +203,7 @@ def get_arcs(
             n_selected_px, arc_n_samples, ray_n_samples
         )
 
-        rnd = torch.rand((n_selected_px, arc_n_samples, ray_n_samples)) * sonar_resolution
+        rnd = torch.rand((n_selected_px, arc_n_samples, ray_n_samples), device=device) * sonar_resolution
 
         if randomize_points:
             r_samples = r_samples + rnd
@@ -230,7 +232,7 @@ def get_arcs(
 
         dists = torch.diff(r_samples, dim=1)
         dists = torch.cat(
-            [dists, torch.Tensor([sonar_resolution]).expand(dists[..., :1].shape)], -1
+            [dists, torch.tensor([sonar_resolution], dtype=torch.float32, device=device).expand(dists[..., :1].shape)], -1
         )
 
         # r_samples_mid = r_samples + dists/2
@@ -238,7 +240,7 @@ def get_arcs(
         X_r_rand = pts[:, 0] * torch.cos(pts[:, 1]) * torch.cos(pts[:, 2])
         Y_r_rand = pts[:, 0] * torch.sin(pts[:, 1]) * torch.cos(pts[:, 2])
         Z_r_rand = pts[:, 0] * torch.sin(pts[:, 2])
-        pts_r_rand = torch.stack((X_r_rand, Y_r_rand, Z_r_rand, torch.ones_like(X_r_rand)))
+        pts_r_rand = torch.stack((X_r_rand, Y_r_rand, Z_r_rand, torch.ones_like(X_r_rand))).to(device)
 
         pts_r_rand = torch.matmul(c2w, pts_r_rand)
 
@@ -256,7 +258,7 @@ def get_arcs(
         dists = t_ends - t_starts 
 
         # handle endpoints in a hacky way 
-        dists_ep = torch.tensor(sonar_resolution).expand(t_max.shape) 
+        dists_ep = torch.tensor(sonar_resolution, dtype=torch.float32, device=device).expand(t_max.shape) 
         pts_ep = rays_o + t_max[:, None] * dirs 
         pts_r_rand = torch.cat([pts_r_rand, pts_ep], dim=0)
         dists = torch.cat([dists, dists_ep], dim=0)

@@ -29,6 +29,7 @@ import argparse
 import shutil
 
 import NeuS.exp_runner
+from device_utils import get_preferred_device
 
 from math import ceil
 
@@ -110,7 +111,7 @@ class Runner:
         dataset = self.conf.get_string('conf.dataset')
         self.image_setkeyname =  self.conf.get_string('conf.image_setkeyname') 
 
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device("cuda") #if torch.cuda.is_available() else torch.device("cpu")
         self.dataset = dataset
         # Training parameters
         self.end_iter = self.conf.get_int('train.end_iter')
@@ -171,7 +172,7 @@ class Runner:
         self.hfov = self.data["hfov"]
 
 
-        self.cube_center = torch.Tensor([(self.x_max + self.x_min)/2, (self.y_max + self.y_min)/2, (self.z_max + self.z_min)/2])
+        self.cube_center = torch.tensor([(self.x_max + self.x_min)/2, (self.y_max + self.y_min)/2, (self.z_max + self.z_min)/2], dtype=torch.float32, device=self.device)
 
         self.timef = self.conf.get_bool('conf.timef')
         self.end_iter = self.conf.get_int('train.end_iter')
@@ -271,11 +272,11 @@ class Runner:
             self.occ_eval_fn = make_occ_eval_fn(self) 
             grid_resolution = 128
             grid_nlvl = 1
-            device = torch.device("cuda:0")
+            device = self.device
             aabb = torch.tensor([-1.0, -1.0, -1.0, 1.0, 1.0, 1.0], device=device)
             self.estimator = OccGridEstimator(
                 roi_aabb=aabb, resolution=grid_resolution, levels=grid_nlvl
-            ).cuda()
+            ).to(device)
         else:
             self.estimator = None
 
@@ -293,7 +294,7 @@ class Runner:
             target = self.data[self.image_setkeyname][img_i]
             target = torch.Tensor(target).to(self.device)
             pose = self.data["sensor_poses"][img_i]
-            c2w = torch.tensor(pose).cuda().float()
+            c2w = torch.tensor(pose, dtype=torch.float32, device=self.device)
             coords = torch.nonzero(target)
             n_pixels = len(coords)
             if n_pixels == 0: continue
@@ -302,7 +303,7 @@ class Runner:
 
             # old
             if not use_new:
-                _, _, _, _, pts, _ = get_arcs(self.H, self.W, self.phi_min, self.phi_max, self.r_min, self.r_max,  torch.Tensor(pose), n_pixels,
+                _, _, _, _, pts, _ = get_arcs(self.H, self.W, self.phi_min, self.phi_max, self.r_min, self.r_max,  torch.tensor(pose, dtype=torch.float32, device=self.device), n_pixels,
                                                         self.arc_n_samples, self.ray_n_samples, self.hfov, coords,
                                                         self.r_increments, self.randomize_points, 
                                                         self.device, self.cube_center)
@@ -422,7 +423,7 @@ class Runner:
                 # print(n_pixels)
 
                 # r holds radius per sample if estimator is none, otherwise it is  nONe
-                rays_d, dphi, r, rs, pts, dists = get_arcs(self.H, self.W, self.phi_min, self.phi_max, self.r_min, self.r_max,  torch.Tensor(pose), n_pixels,
+                rays_d, dphi, r, rs, pts, dists = get_arcs(self.H, self.W, self.phi_min, self.phi_max, self.r_min, self.r_max,  torch.tensor(pose, dtype=torch.float32, device=self.device), n_pixels,
                                                         self.arc_n_samples, self.ray_n_samples, self.hfov, coords, self.r_increments, 
                                                         self.randomize_points, self.device, self.cube_center, self.estimator)
 
@@ -553,7 +554,7 @@ class Runner:
                     if epoch_num == 0 or epoch_num % self.val_mesh_freq == 0:
                         mesh_path = self.validate_mesh(threshold = self.level_set)
                         if self.neus_conf is not None: 
-                            # self.neus_runner.validate_mesh() 
+                            self.neus_runner.validate_mesh() 
                             self.neus_runner.validate_image()
                         if self.use_wandb:
                             log_dict["mesh_recon"] = wandb.Object3D(open(mesh_path))
@@ -608,6 +609,10 @@ class Runner:
     def load_checkpoint(self, checkpoint_name):
         # checkpoint = torch.load(os.path.join(self.base_exp_dir, 'checkpoints', checkpoint_name), map_location=self.device)
         checkpoint = torch.load(checkpoint_name, map_location=self.device)
+        # Depois de carregar, force movimento
+        self.sdf_network.load_state_dict(checkpoint['sdf_network_fine'])
+        self.sdf_network = self.sdf_network.to(self.device)
+
         self.sdf_network.load_state_dict(checkpoint['sdf_network_fine'])
         self.deviation_network.load_state_dict(checkpoint['variance_network_fine'])
         self.color_network.load_state_dict(checkpoint['color_network_fine'])
@@ -636,6 +641,13 @@ class Runner:
         bound_min = torch.tensor(self.object_bbox_min, dtype=torch.float32)
         bound_max = torch.tensor(self.object_bbox_max, dtype=torch.float32)
 
+        self.sdf_network = self.sdf_network.to(self.device)
+        self.deviation_network = self.deviation_network.to(self.device)
+        self.color_network = self.color_network.to(self.device)
+        self.renderer.sdf_network = self.sdf_network
+        self.renderer.deviation_network = self.deviation_network
+        self.renderer.color_network = self.color_network
+
         vertices, triangles =\
             self.renderer.extract_geometry(bound_min, bound_max, resolution=resolution, threshold=threshold)
 
@@ -647,11 +659,13 @@ class Runner:
         mesh = trimesh.Trimesh(vertices, triangles)
         mesh_path = os.path.join(self.base_exp_dir, 'meshes', '{:0>8d}.obj'.format(self.iter_step))
         mesh.export(mesh_path)
+        #for name, p in self.sdf_network.named_parameters():
+        #    print(name, p.device)
         return mesh_path
 
 
 if __name__=='__main__':
-    torch.set_default_tensor_type('torch.cuda.FloatTensor')
+    # Keep tensor defaults on the standard CPU dtype; device placement is explicit.
     FORMAT = "[%(filename)s:%(lineno)s - %(funcName)20s() ] %(message)s"
     logging.getLogger('matplotlib.font_manager').disabled = True
     logging.basicConfig(level=logging.DEBUG, format=FORMAT)

@@ -7,6 +7,7 @@ from glob import glob
 from icecream import ic
 from scipy.spatial.transform import Rotation as Rot
 from scipy.spatial.transform import Slerp
+from device_utils import get_preferred_device
 
 
 # This function is borrowed from IDR: https://github.com/lioryariv/idr
@@ -43,23 +44,48 @@ def cvt_neus_coords_to_ho_coords(pts):
     cmat = torch.tensor(
         [[0.0, 0.0, 1.0], 
         [-1.0, 0.0, 0.0], 
-        [0.0, -1.0, 0.0]])
+        [0.0, -1.0, 0.0]],
+        device=pts.device,
+        dtype=pts.dtype,
+    )
     out = pts @ cmat.T
     return out.reshape(original_shape)
+
+
+def _find_image_dir(data_dir):
+    for candidate in ("images_wb", "Images_wb", "image", "images"):
+        candidate_path = os.path.join(data_dir, candidate)
+        if os.path.isdir(candidate_path):
+            return candidate_path
+    return None
+
+
+def _load_image_files(image_dir):
+    image_paths = []
+    for pattern in ("*.png", "*.jpg", "*.jpeg", "*.JPG", "*.JPEG"):
+        image_paths.extend(glob(os.path.join(image_dir, pattern)))
+    return sorted(image_paths)
 
 class Dataset:
     def __init__(self, conf):
         super(Dataset, self).__init__()
         print('Load data: Begin')
-        self.device = torch.device('cuda')
+        self.device = get_preferred_device()
         self.conf = conf
 
         self.data_dir = conf.get_string('data_dir')
-        self.render_cameras_name = conf.get_string('render_cameras_name')
-        self.object_cameras_name = conf.get_string('object_cameras_name')
-
         self.camera_outside_sphere = conf.get_bool('camera_outside_sphere', default=True)
         self.scale_mat_scale = conf.get_float('scale_mat_scale', default=1.1)
+
+        self.is_seathru = os.path.exists(os.path.join(self.data_dir, 'poses_bounds.npy')) and _find_image_dir(self.data_dir) is not None
+
+        if self.is_seathru:
+            self._load_seathru_dataset()
+            print('Load data: End')
+            return
+
+        self.render_cameras_name = conf.get_string('render_cameras_name', default='cameras_sphere.npz')
+        self.object_cameras_name = conf.get_string('object_cameras_name', default='cameras_sphere.npz')
 
         camera_dict = np.load(os.path.join(self.data_dir, self.render_cameras_name))
         self.camera_dict = camera_dict
@@ -107,6 +133,60 @@ class Dataset:
 
         print('Load data: End')
 
+    def _load_seathru_dataset(self):
+        poses_bounds = np.load(os.path.join(self.data_dir, 'poses_bounds.npy')).astype(np.float32)
+        poses = poses_bounds[:, :-2].reshape([-1, 3, 5])
+        bds = poses_bounds[:, -2:]
+
+        image_dir = _find_image_dir(self.data_dir)
+        self.images_lis = _load_image_files(image_dir)
+        if not self.images_lis:
+            raise FileNotFoundError(f'No images found in {image_dir}')
+
+        self.n_images = len(self.images_lis)
+        self.images_np = np.stack([cv.imread(im_name) for im_name in self.images_lis]) / 256.0
+        self.masks_np = np.ones_like(self.images_np)
+
+        H, W, focal = poses[0, :, 4]
+        self.H = int(round(float(H)))
+        self.W = int(round(float(W)))
+
+        scale = 1.0 / max(1.0, float(np.min(bds) * 0.75))
+
+        self.intrinsics_all = []
+        self.pose_all = []
+        for pose in poses:
+            intrinsics = np.eye(4, dtype=np.float32)
+            intrinsics[0, 0] = float(focal)
+            intrinsics[1, 1] = float(focal)
+            intrinsics[0, 2] = float(W) * 0.5
+            intrinsics[1, 2] = float(H) * 0.5
+
+            c2w = np.eye(4, dtype=np.float32)
+            c2w[:3, :4] = pose[:3, :4]
+            c2w[:3, 3] *= scale
+
+            self.intrinsics_all.append(torch.from_numpy(intrinsics).float())
+            self.pose_all.append(torch.from_numpy(c2w).float())
+
+        self.images = torch.from_numpy(self.images_np.astype(np.float32)).cpu()
+        self.masks = torch.from_numpy(self.masks_np.astype(np.float32)).cpu()
+        self.intrinsics_all = torch.stack(self.intrinsics_all).to(self.device)
+        self.intrinsics_all_inv = torch.inverse(self.intrinsics_all)
+        self.focal = self.intrinsics_all[0][0, 0]
+        self.pose_all = torch.stack(self.pose_all).to(self.device)
+        self.image_pixels = self.H * self.W
+
+        camera_centers = self.pose_all[:, :3, 3].detach().cpu().numpy()
+        scene_radius = float(np.linalg.norm(camera_centers, axis=1).max())
+        bbox_radius = max(1.01, scene_radius * 2.0)
+        self.object_bbox_min = np.array([-bbox_radius, -bbox_radius, -bbox_radius], dtype=np.float32)
+        self.object_bbox_max = np.array([bbox_radius, bbox_radius, bbox_radius], dtype=np.float32)
+
+        self.camera_dict = None
+        self.world_mats_np = []
+        self.scale_mats_np = []
+
     def gen_rays_at(self, img_idx, resolution_level=1):
         """
         Generate rays at world space from one camera.
@@ -130,8 +210,8 @@ class Dataset:
         """
         pixels_x = torch.randint(low=0, high=self.W, size=[batch_size])
         pixels_y = torch.randint(low=0, high=self.H, size=[batch_size])
-        color = self.images[img_idx].cuda()[(pixels_y, pixels_x)]    # batch_size, 3
-        mask = self.masks[img_idx].cuda()[(pixels_y, pixels_x)]      # batch_size, 3
+        color = self.images[img_idx].to(self.device)[(pixels_y, pixels_x)]    # batch_size, 3
+        mask = self.masks[img_idx].to(self.device)[(pixels_y, pixels_x)]      # batch_size, 3
         p = torch.stack([pixels_x, pixels_y, torch.ones_like(pixels_y)], dim=-1).float()  # batch_size, 3
         p = torch.matmul(self.intrinsics_all_inv[img_idx, None, :3, :3], p[:, :, None]).squeeze() # batch_size, 3
         rays_v = p / torch.linalg.norm(p, ord=2, dim=-1, keepdim=True)    # batch_size, 3
@@ -140,7 +220,7 @@ class Dataset:
             # switch to holoocean coordinates 
         rays_v = cvt_neus_coords_to_ho_coords(rays_v)
         rays_o = cvt_neus_coords_to_ho_coords(rays_o)
-        return torch.cat([rays_o, rays_v, color, mask[:, :1]], dim=-1).cuda()    # batch_size, 10
+        return torch.cat([rays_o, rays_v, color, mask[:, :1]], dim=-1).to(self.device)    # batch_size, 10
 
     def gen_rays_between(self, idx_0, idx_1, ratio, resolution_level=1):
         """
@@ -169,8 +249,8 @@ class Dataset:
         pose[:3, :3] = rot.as_matrix()
         pose[:3, 3] = ((1.0 - ratio) * pose_0 + ratio * pose_1)[:3, 3]
         pose = np.linalg.inv(pose)
-        rot = torch.from_numpy(pose[:3, :3]).cuda()
-        trans = torch.from_numpy(pose[:3, 3]).cuda()
+        rot = torch.from_numpy(pose[:3, :3]).to(self.device)
+        trans = torch.from_numpy(pose[:3, 3]).to(self.device)
         rays_v = torch.matmul(rot[None, None, :3, :3], rays_v[:, :, :, None]).squeeze()  # W, H, 3
         rays_o = trans[None, None, :3].expand(rays_v.shape)  # W, H, 3
         rays_o = cvt_neus_coords_to_ho_coords(rays_o) 

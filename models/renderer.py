@@ -10,32 +10,19 @@ import pickle
 import time 
 # from nerfacc import inclusive_prod, pack_info
 
-def extract_fields(bound_min, bound_max, resolution, query_func, return_coords=False):
+
+def extract_fields(bound_min, bound_max, resolution, query_func):
+    device = torch.device('cuda')
     N = 64
-    X_coords = torch.linspace(bound_min[0], bound_max[0], resolution)
-    Y_coords = torch.linspace(bound_min[1], bound_max[1], resolution)
-    Z_coords = torch.linspace(bound_min[2], bound_max[2], resolution)
-    X = X_coords.split(N)
-    Y = Y_coords.split(N)
-    Z = Z_coords.split(N)
-
-    u = np.zeros([resolution, resolution, resolution], dtype=np.float32)
-    with torch.no_grad():
-        for xi, xs in enumerate(X):
-            for yi, ys in enumerate(Y):
-                for zi, zs in enumerate(Z):
-                    xx, yy, zz = torch.meshgrid(xs, ys, zs)
-                    pts = torch.cat([xx.reshape(-1, 1), yy.reshape(-1, 1), zz.reshape(-1, 1)], dim=-1)
-                    val = query_func(pts).reshape(len(xs), len(ys), len(zs)).detach().cpu().numpy()
-                    u[xi * N: xi * N + len(xs), yi * N: yi * N + len(ys), zi * N: zi * N + len(zs)] = val
-
-    if return_coords:
-        return u, X_coords, Y_coords, Z_coords
-    else:
-        return u
-
-
-def extract_geometry(bound_min, bound_max, resolution, threshold, query_func):
+    X = torch.linspace(bound_min[0], bound_max[0], resolution, device=device)
+    Y = torch.linspace(bound_min[1], bound_max[1], resolution, device=device)
+    Z = torch.linspace(bound_min[2], bound_max[2], resolution, device=device)
+    xs, ys, zs = torch.meshgrid(X, Y, Z, indexing='ij')
+    pts = torch.stack([xs.reshape(-1), ys.reshape(-1), zs.reshape(-1)], dim=-1)
+    val = query_func(pts).reshape(resolution, resolution, resolution).detach().cpu().numpy()
+    return val
+ 
+def extract_geometry(bound_min, bound_max, resolution, threshold, query_func=lambda pts: -self.sdf_network.sdf(pts.to(self.sdf_network.lin0.weight.device))):
     u = extract_fields(bound_min, bound_max, resolution, query_func)
     vertices, triangles = mcubes.marching_cubes(u, threshold)
 
@@ -159,6 +146,12 @@ class NeuSRenderer:
         # print(pts_mid.shape)
         if render_mode:
             with torch.no_grad():
+                # Dentro de render_core_sonar, antes da chamada color_network
+                #print(f"[DEBUG] pts_mid shape: {pts_mid.shape}")            # deve ser [N, 3]
+                #print(f"[DEBUG] gradients shape: {gradients.shape}")        # deve ser [N, 3]
+                #print(f"[DEBUG] dirs shape: {dirs.shape}")                  # deve ser [N, 3]
+                #print(f"[DEBUG] feature_vector: {feature_vector.shape if feature_vector is not None else None}")
+
                 sampled_color = color_network(pts_mid, gradients, dirs, feature_vector).reshape(n_pixels, arc_n_samples, ray_n_samples)
 
                 inv_s = deviation_network(torch.zeros([1, 3]))[:, :1].clip(1e-6, 1e6)
@@ -189,17 +182,13 @@ class NeuSRenderer:
 
         alpha = ((p + 1e-5) / (c + 1e-5)).reshape(n_pixels, arc_n_samples, ray_n_samples).clip(0.0, 1.0)
 
-        cumuProdAllPointsOnEachRay = torch.cat([torch.ones([n_pixels, arc_n_samples, 1]), 1. - alpha + 1e-7], -1)
-    
-        cumuProdAllPointsOnEachRay = torch.cumprod(cumuProdAllPointsOnEachRay, -1)
+        cumuProdAllPointsOnEachRay = torch.cat([torch.ones([n_pixels, arc_n_samples, 1], device=alpha.device), 1. - alpha + 1e-7], dim=-1)
+        cumuProdPrevPointOnEachRay = torch.cat([torch.ones([n_pixels, arc_n_samples, 1], device=alpha.device), cumuProdAllPointsOnEachRay[:, :, :-1]], dim=-1)
 
-        TransmittancePointsOnArc = cumuProdAllPointsOnEachRay[:, :, ray_n_samples-2]
-        
-        alphaPointsOnArc = alpha[:, :, ray_n_samples-1]
-
-        weights = alphaPointsOnArc * TransmittancePointsOnArc 
-
-        intensityPointsOnArc = sampled_color[:, :, ray_n_samples-1]
+        TransmittancePointsOnArc = cumuProdAllPointsOnEachRay[:, :, ray_n_samples-2]   # shape [n_pixels, arc_n_samples]
+        alphaPointsOnArc = alpha[:, :, ray_n_samples-1]                               # shape [n_pixels, arc_n_samples]
+        weights = alphaPointsOnArc * TransmittancePointsOnArc                         # shape [n_pixels, arc_n_samples]
+        intensityPointsOnArc = sampled_color[:, :, ray_n_samples-1]                   # shape [n_pixels, arc_n_samples]
 
         summedIntensities = (intensityPointsOnArc*weights).sum(dim=1) 
 
@@ -280,4 +269,4 @@ class NeuSRenderer:
                                 bound_max,
                                 resolution=resolution,
                                 threshold=threshold,
-                                query_func=lambda pts: -self.sdf_network.sdf(pts))
+                                query_func=lambda pts: -self.sdf_network.sdf(pts.to(self.sdf_network.lin0.weight.device)))

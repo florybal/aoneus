@@ -20,9 +20,9 @@ class Embedder:
         N_freqs = self.kwargs['num_freqs']
 
         if self.kwargs['log_sampling']:
-            freq_bands = 2. ** torch.linspace(0., max_freq, N_freqs)
+            freq_bands = (2. ** torch.linspace(0., max_freq, N_freqs, device="cpu")).tolist()
         else:
-            freq_bands = torch.linspace(2.**0., 2.**max_freq, N_freqs)
+            freq_bands = torch.linspace(2.**0., 2.**max_freq, N_freqs, device="cpu").tolist()
 
         for freq in freq_bands:
             for p_fn in self.kwargs['periodic_fns']:

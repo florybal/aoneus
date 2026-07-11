@@ -103,8 +103,12 @@ class SDFNetwork(nn.Module):
             grad_outputs=d_output,
             create_graph=True,
             retain_graph=True,
-            only_inputs=True)[0]
-        return gradients.unsqueeze(1)
+            only_inputs=True,
+            allow_unused=True
+        )[0]
+        if gradients is None:
+            gradients = torch.zeros_like(x)
+        return gradients.unsqueeze(1).to(x.device)
 
 
 # This implementation is borrowed from IDR: https://github.com/lioryariv/idr

@@ -15,11 +15,12 @@ from pyhocon import ConfigFactory
 from .models.dataset import Dataset
 from .models.fields import RenderingNetwork, SDFNetwork, SingleVarianceNetwork, NeRF
 from .models.renderer import NeuSRenderer
+from device_utils import get_preferred_device
 
 
 class Runner:
     def __init__(self, conf_path, mode='train', case='CASE_NAME', is_continue=False, init_opt=True, sdf_network=None, random_seed=0):
-        self.device = torch.device('cuda')
+        self.device = get_preferred_device()
         self.init_opt = init_opt
         # Configuration
         self.conf_path = conf_path
@@ -383,7 +384,7 @@ class Runner:
 if __name__ == '__main__':
     print('Hello Wooden')
 
-    torch.set_default_tensor_type('torch.cuda.FloatTensor')
+    # Keep tensor defaults on the standard CPU dtype; device placement is explicit.
 
     FORMAT = "[%(filename)s:%(lineno)s - %(funcName)20s() ] %(message)s"
     logging.basicConfig(level=logging.DEBUG, format=FORMAT)
@@ -400,7 +401,8 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
 
-    torch.cuda.set_device(args.gpu)
+    if get_preferred_device().type == 'cuda':
+        torch.cuda.set_device(args.gpu)
     runner = Runner(args.conf, args.mode, args.case, args.is_continue, random_seed=args.random_seed)
 
     if args.mode == 'train':
