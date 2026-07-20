@@ -33,6 +33,8 @@ from device_utils import get_preferred_device
 
 from math import ceil
 
+from load_sonarcloud import load_sonarcloud
+
 # set seeds
 torch.random.manual_seed(0)
 np.random.seed(0)
@@ -160,8 +162,11 @@ class Runner:
         self.z_min = self.conf.get_float('mesh.z_min')
         self.level_set = self.conf.get_float('mesh.level_set')
 
-        self.data = load_data(dataset)
-
+        if "SonarCloud" in dataset or "sonar_cloud" in dataset.lower():
+            from load_sonarcloud import load_sonarcloud
+            self.data = load_sonarcloud(dataset)
+        else:
+            self.data = load_data(dataset)
         self.H, self.W = self.data[self.image_setkeyname][0].shape
 
         self.r_min = self.data["min_range"]
