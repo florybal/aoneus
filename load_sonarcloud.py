@@ -5,6 +5,7 @@ import cv2
 import json
 from tqdm import tqdm
 from scipy.spatial.transform import Rotation as Rot
+import math
 
 def parse_pose_from_path(path):
     """
@@ -61,8 +62,8 @@ def load_sonarcloud(data_dir, max_images=5000):
                     cfg = sensor.get('configuration', {})
                     H = cfg.get('RangeBins', 256)
                     W = cfg.get('AzimuthBins', 96)
-                    vfov = cfg.get('Elevation', 12.0)
-                    hfov = cfg.get('Azimuth', 60.0)
+                    vfov = math.radians(cfg.get('Elevation', 12.0))
+                    hfov = math.radians(cfg.get('Azimuth', 60.0))
                     min_range = cfg.get('RangeMin', 0.01)
                     max_range = cfg.get('RangeMax', 3.3)
                     break
