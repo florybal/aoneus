@@ -19,6 +19,11 @@ from pyhocon import ConfigFactory
 from models.fields import RenderingNetwork, SDFNetwork, SingleVarianceNetwork, NeRF
 from models.renderer import NeuSRenderer
 import trimesh
+
+import csv
+from datetime import datetime, timezone
+from scipy.spatial import cKDTree
+
 from itertools import groupby
 from operator import itemgetter
 from load_data import *
@@ -31,7 +36,7 @@ import shutil
 import NeuS.exp_runner
 from device_utils import get_preferred_device
 
-from math import ceil
+import math
 
 from load_sonarcloud import load_sonarcloud
 
@@ -130,6 +135,42 @@ class Runner:
         self.r_div = self.conf.get_bool('train.r_div')
         self.train_frac = self.conf.get_float("train.train_frac", default=1.0)
         self.accel = self.conf.get_bool('train.accel', default=False)
+
+         # Metrics
+        self.metrics_enabled = self.conf.get_bool(
+            "metrics.enabled",
+            default=True
+        )
+
+        self.metrics_n_samples = self.conf.get_int(
+            "metrics.n_samples",
+            default=100000
+        )
+
+        self.metrics_thresholds = self.conf.get_list(
+            "metrics.thresholds",
+            default=[0.01, 0.02, 0.05]
+        )
+
+        self.metrics_thresholds = [
+            float(x) for x in self.metrics_thresholds
+        ]
+
+        self.metrics_save_per_mesh = self.conf.get_bool(
+            "metrics.save_per_mesh",
+            default=True
+        )
+
+        self.metrics_save_csv = self.conf.get_bool(
+            "metrics.save_csv",
+            default=True
+        )
+
+        self.gt_geometry_path = self.conf.get_string(
+            "metrics.gt_geometry",
+            default=""
+        )
+
         # breakpoint()
         self.val_img_freq = self.conf.get_int("train.val_img_freq", default=10000)
         self.lamb_shading = self.conf.get_bool("train.lamb_shading", default=False)
@@ -149,7 +190,32 @@ class Runner:
         self.ray_n_samples = self.conf['model.neus_renderer']['n_samples']
         # TODO: make below more flexible
         self.base_exp_dir = f"{self.expID}/{self.random_seed}"
+        # Diretórios do experimento
+        for dirname in [
+            "checkpoints",
+            "normals",
+            "meshes",
+            "recordings",
+            "validations_fine",
+            "metrics",
+        ]:
+            os.makedirs(
+                os.path.join(self.base_exp_dir, dirname),
+                exist_ok=True
+            )
+
+        self.metrics_dir = os.path.join(
+            self.base_exp_dir,
+            "metrics"
+        )
+
+        os.makedirs(self.metrics_dir, exist_ok=True)
         os.makedirs(self.base_exp_dir, exist_ok=True)
+        self.mesh_resolution = self.conf.get_int(
+            "mesh.resolution",
+            default=64
+        )
+
         shutil.copy(self.conf_path, f"{self.base_exp_dir}/config.conf")
         self.randomize_points = self.conf.get_float('train.randomize_points')
         self.select_px_method = self.conf.get_string('train.select_px_method')
@@ -161,7 +227,7 @@ class Runner:
         self.z_max = self.conf.get_float('mesh.z_max')
         self.z_min = self.conf.get_float('mesh.z_min')
         self.level_set = self.conf.get_float('mesh.level_set')
-
+       
         if "SonarCloud" in dataset or "sonar_cloud" in dataset.lower():
             from load_sonarcloud import load_sonarcloud
             self.data = load_sonarcloud(dataset)
@@ -213,18 +279,12 @@ class Runner:
 
         self.i_train = np.arange(len(self.data[self.image_setkeyname]))
 
-        self.coords_all_ls = [(x, y) for x in np.arange(self.H) for y in np.arange(self.W)]
-        self.coords_all_set = set(self.coords_all_ls)
-
-        #self.coords_all = torch.from_numpy(np.array(self.coords_all_ls)).to(self.device)
-
-        self.del_coords = []
-        for y in np.arange(self.W):
-            tmp = [(x, y) for x in np.arange(0, self.ray_n_samples)]
-            self.del_coords.extend(tmp)
-
-        self.coords_all = list(self.coords_all_set - set(self.del_coords))
-        self.coords_all = torch.LongTensor(self.coords_all).to(self.device)
+        self.coords_all = torch.stack(
+        torch.meshgrid(
+            torch.arange(self.H, device=self.device),
+            torch.arange(self.W, device=self.device),
+            indexing="ij"
+        ), dim=-1 ).reshape(-1, 2)
 
         self.criterion = torch.nn.L1Loss(reduction='sum')
         
@@ -285,6 +345,391 @@ class Runner:
         else:
             self.estimator = None
 
+        self.gt_mesh = self.load_ground_truth_geometry()
+
+    def load_ground_truth_geometry(self):
+        """
+        Carrega a geometria ground truth uma única vez.
+
+        Retorna um trimesh.Trimesh ou None.
+        """
+
+        if not self.gt_geometry_path:
+            return None
+
+        if not os.path.exists(self.gt_geometry_path):
+            logging.warning(
+                "Ground truth não encontrado: %s",
+                self.gt_geometry_path
+            )
+            return None
+
+        try:
+            gt = trimesh.load(
+                self.gt_geometry_path,
+                force="mesh",
+                process=False
+            )
+
+            logging.info(
+                "Ground truth carregado: %s vertices, %s faces",
+                len(gt.vertices),
+                len(gt.faces)
+            )
+
+            return gt
+
+        except Exception as e:
+            logging.exception(
+                "Erro carregando ground truth: %s",
+                e
+            )
+            return None
+        
+    def evaluate_mesh_metrics(self, mesh, mesh_path):
+        """
+        Calcula métricas da mesh reconstruída.
+
+        Sempre calcula estatísticas da mesh.
+
+        Se self.gt_mesh existir, também calcula:
+        - Chamfer L1
+        - Chamfer L2
+        - Accuracy
+        - Completeness
+        - Precision
+        - Recall
+        - F1
+        """
+
+        metrics = {
+            "iteration": int(self.iter_step),
+            "mesh": os.path.relpath(
+                mesh_path,
+                self.base_exp_dir
+            ),
+            "timestamp_utc": datetime.now(
+                timezone.utc
+            ).isoformat(),
+
+            "mesh_stats": {
+                "vertices": int(len(mesh.vertices)),
+                "faces": int(len(mesh.faces)),
+                "is_watertight": bool(mesh.is_watertight),
+                "is_winding_consistent": bool(
+                    mesh.is_winding_consistent
+                ),
+            }
+        }
+
+        # Bounds
+        if len(mesh.vertices) > 0:
+
+            bounds = mesh.bounds
+
+            metrics["mesh_stats"]["bounds_min"] = (
+                bounds[0].astype(float).tolist()
+            )
+
+            metrics["mesh_stats"]["bounds_max"] = (
+                bounds[1].astype(float).tolist()
+            )
+
+        # Sem GT: salva somente estatísticas
+        if self.gt_mesh is None:
+            return metrics
+
+        # Mesh vazia
+        if len(mesh.vertices) == 0:
+
+            metrics["geometry"] = {
+                "error": "Predicted mesh has no vertices"
+            }
+
+            return metrics
+
+        if len(self.gt_mesh.vertices) == 0:
+
+            metrics["geometry"] = {
+                "error": "Ground truth mesh has no vertices"
+            }
+
+            return metrics
+
+        # -------------------------------------------------
+        # Amostragem de pontos nas superfícies
+        # -------------------------------------------------
+
+        n_samples = self.metrics_n_samples
+
+        pred_points, _ = trimesh.sample.sample_surface(
+            mesh,
+            n_samples
+        )
+
+        gt_points, _ = trimesh.sample.sample_surface(
+            self.gt_mesh,
+            n_samples
+        )
+
+        # -------------------------------------------------
+        # KD Trees
+        # -------------------------------------------------
+
+        gt_tree = cKDTree(gt_points)
+        pred_tree = cKDTree(pred_points)
+
+        # GT -> Pred
+        dist_gt, idx_gt = pred_tree.query(
+            gt_points,
+            k=1
+        )
+
+        # Pred -> GT
+        dist_pred, idx_pred = gt_tree.query(
+            pred_points,
+            k=1
+)
+
+        # Para cada ponto GT:
+        # distância ao predito = completeness
+        dist_gt_to_pred, _ = pred_tree.query(
+            gt_points,
+            k=1
+        )
+
+        accuracy = float(np.mean(dist_pred_to_gt))
+        completeness = float(np.mean(dist_gt_to_pred))
+
+        chamfer_l1 = float(
+            np.mean(dist_pred_to_gt) +
+            np.mean(dist_gt_to_pred)
+        )
+
+        chamfer_l2 = float(
+            np.mean(dist_pred_to_gt ** 2) +
+            np.mean(dist_gt_to_pred ** 2)
+        )
+
+        metrics["geometry"] = {
+            "accuracy": accuracy,
+            "completeness": completeness,
+            "chamfer_l1": chamfer_l1,
+            "chamfer_l2": chamfer_l2,
+        }
+
+        # -------------------------------------------------
+        # Precision / Recall / F1
+        # -------------------------------------------------
+
+        metrics["thresholds"] = {}
+
+        for threshold in self.metrics_thresholds:
+
+            precision = float(
+                np.mean(
+                    dist_pred_to_gt < threshold
+                )
+            )
+
+            recall = float(
+                np.mean(
+                    dist_gt_to_pred < threshold
+                )
+            )
+
+            if precision + recall > 0:
+
+                f1 = float(
+                    2.0 * precision * recall /
+                    (precision + recall)
+                )
+
+            else:
+
+                f1 = 0.0
+
+            threshold_key = f"{threshold:.6f}"
+
+            metrics["thresholds"][threshold_key] = {
+                "precision": precision,
+                "recall": recall,
+                "f1": f1
+            }
+
+        return metrics
+    def save_mesh_metrics(self, metrics):
+        """
+        Salva:
+        - metrics/XXXXXXXX.json
+        - metrics.csv
+        - best_metrics.json
+        """
+
+        iteration = metrics["iteration"]
+
+        # ---------------------------------------------
+        # JSON individual
+        # ---------------------------------------------
+
+        json_path = os.path.join(
+            self.metrics_dir,
+            f"{iteration:08d}.json"
+        )
+
+        if self.metrics_save_per_mesh:
+
+            with open(json_path, "w") as f:
+
+                json.dump(
+                    metrics,
+                    f,
+                    indent=2,
+                    allow_nan=False
+                )
+
+        # ---------------------------------------------
+        # CSV consolidado
+        # ---------------------------------------------
+
+        if self.metrics_save_csv:
+
+            csv_path = os.path.join(
+                self.base_exp_dir,
+                "metrics.csv"
+            )
+
+            row = {
+                "iteration": iteration,
+                "mesh": metrics["mesh"],
+                "vertices": metrics["mesh_stats"]["vertices"],
+                "faces": metrics["mesh_stats"]["faces"],
+                "is_watertight": metrics["mesh_stats"]["is_watertight"],
+            }
+
+            geometry = metrics.get("geometry", {})
+
+            for key in [
+                "accuracy",
+                "completeness",
+                "chamfer_l1",
+                "chamfer_l2"
+            ]:
+                row[key] = geometry.get(key, "")
+
+            for threshold, values in metrics.get(
+                "thresholds",
+                {}
+            ).items():
+
+                safe_threshold = threshold.replace(".", "_")
+
+                row[
+                    f"precision_{safe_threshold}"
+                ] = values["precision"]
+
+                row[
+                    f"recall_{safe_threshold}"
+                ] = values["recall"]
+
+                row[
+                    f"f1_{safe_threshold}"
+                ] = values["f1"]
+
+            file_exists = os.path.exists(csv_path)
+
+            with open(
+                csv_path,
+                "a",
+                newline=""
+            ) as f:
+
+                writer = csv.DictWriter(
+                    f,
+                    fieldnames=list(row.keys())
+                )
+
+                if not file_exists:
+                    writer.writeheader()
+
+                writer.writerow(row)
+
+        # ---------------------------------------------
+        # Melhor resultado
+        # ---------------------------------------------
+
+        self.update_best_metrics(metrics)
+
+        return json_path
+    
+    def update_best_metrics(self, metrics):
+        """
+        Atualiza best_metrics.json.
+
+        Critério:
+        maior F1 do maior threshold configurado.
+        """
+
+        thresholds = metrics.get("thresholds", {})
+
+        if not thresholds:
+            return
+
+        # Usa o threshold central, se possível.
+        threshold_keys = list(thresholds.keys())
+
+        threshold_keys = sorted(
+            threshold_keys,
+            key=float
+        )
+
+        selected_key = threshold_keys[
+            len(threshold_keys) // 2
+        ]
+
+        current_f1 = thresholds[
+            selected_key
+        ]["f1"]
+
+        best_path = os.path.join(
+            self.base_exp_dir,
+            "best_metrics.json"
+        )
+
+        previous_best = None
+
+        if os.path.exists(best_path):
+
+            try:
+                with open(best_path, "r") as f:
+                    previous_best = json.load(f)
+
+            except Exception:
+                previous_best = None
+
+        should_update = (
+            previous_best is None or
+            current_f1 > previous_best.get("value", -np.inf)
+        )
+
+        if should_update:
+
+            best_data = {
+                "best_iteration": metrics["iteration"],
+                "selection_metric": f"f1_{selected_key}",
+                "value": current_f1,
+                "mesh": metrics["mesh"],
+                "metrics_file": (
+                    f"metrics/{metrics['iteration']:08d}.json"
+                )
+            }
+
+            with open(best_path, "w") as f:
+                json.dump(
+                    best_data,
+                    f,
+                    indent=2
+                )
 
     def plotAllArcs(self, use_new=True):
         # This function is used to plot all arc points from all images in the same reference frame
@@ -351,29 +796,89 @@ class Runner:
         return all_points, target
     
     def getRandomImgCoordsByPercentage(self, target):
-        # 1. replace below with torch sampling + masking (double check it still works)
-        # 2. dilate mask ot true locations, so dark areas around bright areas are also preferentially
-        #    sampled 
-        true_coords = []
-        for y in np.arange(self.W):
-            col = target[:, y]
-            gt0 = col > 0
-            indTrue = np.where(gt0)[0]
-            if len(indTrue) > 0:
-                true_coords.extend([(x, y) for x in indTrue])
-        sampling_perc = int(self.percent_select_true*len(true_coords))
-        true_coords = random.sample(true_coords, sampling_perc)
-        true_coords = list(set(true_coords) - set(self.del_coords))
-        true_coords = torch.LongTensor(true_coords).to(self.device)
-        target = torch.Tensor(target).to(self.device)
-        if self.iter_step%len(self.data[self.image_setkeyname]) !=0:
-            N_rand = 0
-        else:
-            N_rand = self.N_rand
+
+        target = torch.as_tensor(
+            target,
+            dtype=torch.float32,
+            device=self.device
+        )
+
+        # --------------------------------------------------
+        # Pixels com intensidade > 0
+        # --------------------------------------------------
+        true_coords = torch.nonzero(target > 0)
+
+        # --------------------------------------------------
+        # Random pixels
+        # --------------------------------------------------
         N_rand = self.N_rand
-        coords = select_coordinates(self.coords_all, target, N_rand, self.select_valid_px)
-        coords = torch.cat((coords, true_coords), dim=0)
-            
+
+        rand_y = torch.randint(
+            0,
+            self.H,
+            (N_rand,),
+            device=self.device
+        )
+
+        rand_x = torch.randint(
+            0,
+            self.W,
+            (N_rand,),
+            device=self.device
+        )
+
+        random_coords = torch.stack(
+            [rand_y, rand_x],
+            dim=1
+        )
+
+        # --------------------------------------------------
+        # Seleciona pixels positivos
+        # --------------------------------------------------
+        if len(true_coords) > 0:
+
+            n_true = int(
+                self.percent_select_true * len(true_coords)
+            )
+
+            n_true = min(
+                n_true,
+                len(true_coords)
+            )
+
+            if n_true > 0:
+                perm = torch.randperm(
+                    len(true_coords),
+                    device=self.device
+                )[:n_true]
+
+                true_coords = true_coords[perm]
+
+        # --------------------------------------------------
+        # Junta
+        # --------------------------------------------------
+        coords = torch.cat(
+            [
+                random_coords,
+                true_coords
+            ],
+            dim=0
+        )
+
+        # --------------------------------------------------
+        # LIMITA O TOTAL
+        # --------------------------------------------------
+        max_pixels = 1000
+
+        if len(coords) > max_pixels:
+
+            perm = torch.randperm(
+                len(coords),
+                device=self.device
+            )[:max_pixels]
+
+            coords = coords[perm]
+
         return coords, target
 
     def train(self):
@@ -400,7 +905,7 @@ class Runner:
         # i_train = i_all[:split_ind]
         # i_val = i_all[split_ind:]
 
-        for i in trange(self.start_iter, self.end_iter, len(self.data[self.image_setkeyname])):
+        for i in trange(self.start_iter, self.end_iter):
             # i_train = np.arange(len(self.data[self.image_setkeyname]))
             np.random.shuffle(i_train)
             loss_total = 0
@@ -425,8 +930,11 @@ class Runner:
                     coords, target = self.getRandomImgCoordsByPercentage(target)
 
                 n_pixels = len(coords)
-                # print(n_pixels)
-
+                print(
+                    f"n_pixels={n_pixels}, "
+                    f"arc_n_samples={self.arc_n_samples}, "
+                    f"ray_n_samples={self.ray_n_samples}"
+                )
                 # r holds radius per sample if estimator is none, otherwise it is  nONe
                 rays_d, dphi, r, rs, pts, dists = get_arcs(self.H, self.W, self.phi_min, self.phi_max, self.r_min, self.r_max,  torch.tensor(pose, dtype=torch.float32, device=self.device), n_pixels,
                                                         self.arc_n_samples, self.ray_n_samples, self.hfov, coords, self.r_increments, 
@@ -640,32 +1148,178 @@ class Runner:
             return 1.0
         else:
             return np.min([1.0, self.iter_step / self.anneal_end])
+    
+    def evaluate_mesh_metrics(
+        self,
+        mesh,
+        mesh_path
+    ):
+        """
+        Compara a malha reconstruída contra o GT
+        obtido dos depth maps.
+        """
 
-    def validate_mesh(self, world_space=False, resolution=64, threshold=0.0):
-        # breakpoint()
-        bound_min = torch.tensor(self.object_bbox_min, dtype=torch.float32)
-        bound_max = torch.tensor(self.object_bbox_max, dtype=torch.float32)
+        print("=" * 60)
+        print("Calculando métricas...")
+        print("=" * 60)
 
-        self.sdf_network = self.sdf_network.to(self.device)
-        self.deviation_network = self.deviation_network.to(self.device)
-        self.color_network = self.color_network.to(self.device)
+        # ---------------------------------------------------------
+        # GT
+        # ---------------------------------------------------------
+
+        gt_points = self.build_gt_pointcloud()
+
+        print("================================")
+        print("GT STATS")
+        print("================================")
+        print("shape:", gt_points.shape)
+        print("min:", gt_points.min(axis=0))
+        print("max:", gt_points.max(axis=0))
+        print("mean:", gt_points.mean(axis=0))
+
+        # ---------------------------------------------------------
+        # pontos da malha
+        # ---------------------------------------------------------
+
+        # amostragem da superfície
+        n_samples = min(
+            100000,
+            max(10000, len(gt_points))
+        )
+
+        pred_points, pred_face_idx = trimesh.sample.sample_surface(
+            mesh,
+            n_samples
+        )
+
+        pred_points = np.asarray(
+            pred_points,
+            dtype=np.float32
+        )
+
+        # ---------------------------------------------------------
+        # nearest neighbor
+        # ---------------------------------------------------------
+
+        gt_cloud = trimesh.PointCloud(gt_points)
+        pred_cloud = trimesh.PointCloud(pred_points)
+
+        # distância GT -> reconstrução
+        closest_gt, dist_gt, _ = trimesh.proximity.closest_point(
+            mesh,
+            gt_points
+        )
+
+        dist_gt = np.abs(dist_gt)
+
+        # reconstrução -> GT
+        closest_pred, dist_pred, _ = trimesh.proximity.closest_point(
+            trimesh.Trimesh(
+                vertices=gt_points,
+                faces=[]
+            ),
+            pred_points
+        )
+
+        dist_pred = np.abs(dist_pred)
+
+        
+    def validate_mesh(
+        self,
+        world_space=False,
+        resolution=None,
+        threshold=0.0
+    ):
+
+        if resolution is None:
+            resolution = self.mesh_resolution
+
+        bound_min = torch.tensor(
+            self.object_bbox_min,
+            dtype=torch.float32
+        )
+
+        bound_max = torch.tensor(
+            self.object_bbox_max,
+            dtype=torch.float32
+        )
+
+        self.sdf_network = self.sdf_network.to(
+            self.device
+        )
+
+        self.deviation_network = (
+            self.deviation_network.to(self.device)
+        )
+
+        self.color_network = self.color_network.to(
+            self.device
+        )
+
         self.renderer.sdf_network = self.sdf_network
-        self.renderer.deviation_network = self.deviation_network
-        self.renderer.color_network = self.color_network
 
-        vertices, triangles =\
-            self.renderer.extract_geometry(bound_min, bound_max, resolution=resolution, threshold=threshold)
+        self.renderer.deviation_network = (
+            self.deviation_network
+        )
 
-        os.makedirs(os.path.join(self.base_exp_dir, 'meshes'), exist_ok=True)
+        self.renderer.color_network = (
+            self.color_network
+        )
+
+        vertices, triangles = (
+            self.renderer.extract_geometry(
+                bound_min,
+                bound_max,
+                resolution=resolution,
+                threshold=threshold
+            )
+        )
+
+        mesh_dir = os.path.join(
+            self.base_exp_dir,
+            "meshes"
+        )
+
+        os.makedirs(
+            mesh_dir,
+            exist_ok=True
+        )
 
         if world_space:
-            vertices = vertices * self.dataset.scale_mats_np[0][0, 0] + self.dataset.scale_mats_np[0][:3, 3][None]
 
-        mesh = trimesh.Trimesh(vertices, triangles)
-        mesh_path = os.path.join(self.base_exp_dir, 'meshes', '{:0>8d}.obj'.format(self.iter_step))
+            vertices = (
+                vertices *
+                self.dataset.scale_mats_np[0][0, 0]
+                +
+                self.dataset.scale_mats_np[0][:3, 3][None]
+            )
+
+        mesh = trimesh.Trimesh(
+            vertices=vertices,
+            faces=triangles,
+            process=False
+        )
+
+        mesh_path = os.path.join(
+            mesh_dir,
+            "{:08d}.obj".format(self.iter_step)
+        )
+
         mesh.export(mesh_path)
-        #for name, p in self.sdf_network.named_parameters():
-        #    print(name, p.device)
+
+        # -----------------------------------------
+        # NEW: avaliar e salvar métricas
+        # -----------------------------------------
+
+        gt_points, gt_normals = self.load_sonarcloud_gt()
+
+        metrics = self.evaluate_mesh_metrics(
+            mesh,
+            mesh_path,
+            gt_points=gt_points,
+            gt_normals=gt_normals
+        )
+
         return mesh_path
 
 
