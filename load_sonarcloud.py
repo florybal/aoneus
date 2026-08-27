@@ -211,6 +211,8 @@ def parse_pose_from_path(path):
 
     moved_idx = None
     orientation_idx = None
+    is_rot = False
+    rot_angle = 0.0
 
     for p in parts:
         if p.startswith("moved_terrain"):
@@ -222,6 +224,17 @@ def parse_pose_from_path(path):
             orientation_idx = int(
                 p.replace("orientation_", "")
             )
+        
+        elif p.startswith("rot"):
+            try:
+                # rot0_90 -> angle = 90
+                angle = float(p.split("_")[-1])
+                rot_angle = angle
+                is_rot = True
+                # orientation_idx fictício para passar no check
+                orientation_idx = 1 
+            except:
+                pass
 
     if moved_idx is None or orientation_idx is None:
         return None
@@ -245,23 +258,26 @@ def parse_pose_from_path(path):
     # ORIENTAÇÃO
     # ==================================================
 
-    orientation_angles = {
-        1: 0.0,
-        2: 45.0,
-        3: 90.0,
-        4: 135.0,
-        5: 180.0,
-        6: 225.0,
-        7: 270.0,
-        8: 315.0,
-    }
+    if is_rot:
+        yaw_deg = rot_angle
+    else:
+        orientation_angles = {
+            1: 0.0,
+            2: 45.0,
+            3: 90.0,
+            4: 135.0,
+            5: 180.0,
+            6: 225.0,
+            7: 270.0,
+            8: 315.0,
+        }
 
-    if orientation_idx not in orientation_angles:
-        raise ValueError(
-            f"Orientação inválida: orientation_{orientation_idx}"
-        )
+        if orientation_idx not in orientation_angles:
+            raise ValueError(
+                f"Orientação inválida: orientation_{orientation_idx}"
+            )
 
-    yaw_deg = orientation_angles[orientation_idx]
+        yaw_deg = orientation_angles[orientation_idx]
 
     R = Rot.from_euler(
         "z",
