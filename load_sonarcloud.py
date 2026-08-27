@@ -1,234 +1,203 @@
 import os
-import torch
-import numpy as np
-import cv2
+import sys
 import json
-from tqdm import tqdm
-from scipy.spatial.transform import Rotation as Rot
 import math
-
-from scipy.spatial.transform import Rotation as Rot
+import cv2
 import numpy as np
-import os
-from data.sonarcloud.reconstruct_data import reconstruct3d
+try:
+    import torch
+except ImportError:
+    torch = None
+try:
+    from tqdm import tqdm
+except ImportError:
+    def tqdm(iterable, *args, **kwargs):
+        return iterable
+from scipy.spatial.transform import Rotation as Rot
+from scipy.spatial import cKDTree
+from PIL import Image
 
-  
-def build_gt_pointcloud(self):
-        """
-        Constrói a nuvem GT a partir dos 8 depth maps + poses.
+try:
+    from data.SonarCloud.reconstruct_data import reconstruct3d, reconstruct3d_points
+except (ImportError, ModuleNotFoundError, ValueError):
+    try:
+        from reconstruct_data import reconstruct3d, reconstruct3d_points
+    except (ImportError, ModuleNotFoundError, ValueError):
+        import importlib.util
+        reconstruct3d = None
+        reconstruct3d_points = None
+        for p in [
+            os.path.join(os.path.dirname(__file__), "data", "SonarCloud", "reconstruct_data.py"),
+            os.path.join(os.path.dirname(__file__), "reconstruct_data.py"),
+            os.path.abspath("data/SonarCloud/reconstruct_data.py")
+        ]:
+            if os.path.exists(p):
+                spec = importlib.util.spec_from_file_location("reconstruct_data", p)
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                reconstruct3d = getattr(mod, "reconstruct3d", None)
+                reconstruct3d_points = getattr(mod, "reconstruct3d_points", None)
+                break
 
-        Estrutura esperada:
 
-        .../orientation_1/
-            depth/
-                depth_0.tiff
-                ...
-                depth_7.tiff
-            rgb/
-                1.jpg
-                ...
-                8.jpg
-            poses_cluster/
-                pose_1.csv
-                ...
-                pose_8.csv
-        """
+def find_sonarcloud_root(path):
+    """
+    Localiza o diretório raiz do dataset SonarCloud contendo poses_cluster e rgb.
+    """
+    p = os.path.abspath(path)
+    while p != os.path.dirname(p):
+        if os.path.basename(p).lower() == "sonarcloud":
+            return p
+        candidate = os.path.join(p, "data", "SonarCloud")
+        if os.path.exists(candidate) and os.path.isdir(candidate):
+            return candidate
+        p = os.path.dirname(p)
+    
+    local_path = os.path.join(os.getcwd(), "data", "SonarCloud")
+    if os.path.exists(local_path):
+        return local_path
+    return None
 
-        # ---------------------------------------------------------
-        # IMPORTANTE:
-        # descobrir a pasta da orientação atual
-        # ---------------------------------------------------------
 
-        # Ajuste esta variável conforme seu dataset.
-        gt_root = self.conf.get_string(
-            "conf.gt_root",
-            default=None
-        )
+def build_gt_pointcloud(
+    data_dir,
+    sonar_cloud_root=None,
+    apply_rotation=True,
+    filter_outliers=True,
+    nb_neighbors=10,
+    std_ratio=2.0
+):
+    """
+    Constrói a nuvem de pontos Ground Truth (GT) 3D a partir dos depth maps do SonarCloud
+    utilizando a reprojeção 3D de reconstruct_data.py.
 
-        if gt_root is None:
-            raise RuntimeError(
-                "conf.gt_root não foi configurado."
-            )
+    Args:
+        data_dir (str): Caminho para a cena ou orientação (ex: data/SonarCloud/sphere_data/.../orientation_1)
+        sonar_cloud_root (str, optional): Raiz do SonarCloud contendo poses_cluster/ e rgb/
+        apply_rotation (bool): Aplica rotação de -90 graus no eixo X (alinhamento padrão do SonarCloud)
+        filter_outliers (bool): Aplica remoção estatística de outliers
+        nb_neighbors (int): Número de vizinhos para filtro de outliers
+        std_ratio (float): Razão de desvio padrão para corte de outliers
 
-        print("GT root:", gt_root)
+    Returns:
+        np.ndarray: Nuvem de pontos GT (N, 3) float32 ou None se nenhum depth for encontrado
+    """
+    if sonar_cloud_root is None:
+        sonar_cloud_root = find_sonarcloud_root(data_dir)
 
-        all_points = []
+    if sonar_cloud_root is None:
+        print(f"[build_gt_pointcloud] Aviso: Não foi possível determinar a raiz do SonarCloud para: {data_dir}")
+        return None
 
-        # ---------------------------------------------------------
-        # câmera
-        # ---------------------------------------------------------
+    # Localizar pastas 'depth'
+    depth_dirs = []
+    if os.path.basename(os.path.normpath(data_dir)) == "depth":
+        depth_dirs.append(data_dir)
+    else:
+        for root, dirs, files in os.walk(data_dir):
+            if os.path.basename(root) == "depth":
+                depth_dirs.append(root)
 
-        hfov_degrees = 60.0
-        vfov_degrees = 60.0
+    depth_dirs.sort()
+    if not depth_dirs:
+        print(f"[build_gt_pointcloud] Nenhum diretório 'depth' encontrado em {data_dir}")
+        return None
 
-        hFov = math.radians(hfov_degrees)
-        vFov = math.radians(vfov_degrees)
+    all_valid_points = []
+    hfov_rad = math.radians(60.0)
+    vfov_rad = math.radians(60.0)
 
-        # ---------------------------------------------------------
-        # 8 orientações / depth maps
-        # ---------------------------------------------------------
+    for d_dir in depth_dirs:
+        # Verifica se é dataset UXO
+        is_uxo = any(k in d_dir.lower() for k in ["uxo", "500lbs", "mortar", "mine"])
+        poses_dir_name = "poses_uxos_cluster" if is_uxo else "poses_cluster"
+        poses_dir = os.path.join(sonar_cloud_root, poses_dir_name)
+        rgb_dir = os.path.join(sonar_cloud_root, "rgb")
 
         for i in range(1, 9):
+            depth_path = os.path.join(d_dir, f"depth_{i-1}.tiff")
+            pose_path = os.path.join(poses_dir, f"pose_{i}.csv")
+            rgb_path = os.path.join(rgb_dir, f"{i}.jpg")
 
-            depth_path = os.path.join(
-                gt_root,
-                "depth",
-                f"depth_{i-1}.tiff"
-            )
+            if not os.path.exists(depth_path) or not os.path.exists(pose_path):
+                continue
 
-            pose_path = os.path.join(
-                gt_root,
-                "poses_cluster",
-                f"pose_{i}.csv"
-            )
-
-            rgb_path = os.path.join(
-                gt_root,
-                "rgb",
-                f"{i}.jpg"
-            )
-
-            if not os.path.exists(depth_path):
-                raise FileNotFoundError(depth_path)
-
-            if not os.path.exists(pose_path):
-                raise FileNotFoundError(pose_path)
-
-            # -----------------------------------------------------
-            # depth
-            # -----------------------------------------------------
-
-            depthmap = cv2.imread(
-                depth_path,
-                cv2.IMREAD_ANYDEPTH
-            )
-
-            if depthmap is None:
-                raise RuntimeError(
-                    f"Não foi possível ler {depth_path}"
-                )
-
-            depthmap = depthmap.astype(np.float32)
-
-            # Seu código original usa 10 como inválido
-            mask = depthmap != 10.0
+            # Ler depth
+            depth_img = Image.open(depth_path)
+            depthmap = np.array(depth_img, dtype=np.float32)
+            mask = (depthmap != 10.0) & (depthmap > 0.0) & np.isfinite(depthmap)
             depthmap[~mask] = 0.0
 
-            # -----------------------------------------------------
-            # RGB
-            # -----------------------------------------------------
-
-            if os.path.exists(rgb_path):
-                image = cv2.imread(rgb_path)
-
-                if image is None:
-                    raise RuntimeError(
-                        f"Não foi possível ler {rgb_path}"
-                    )
-
-                image = cv2.cvtColor(
-                    image,
-                    cv2.COLOR_BGR2RGB
-                )
-            else:
-                # Não precisamos realmente da cor para as métricas.
-                image = np.zeros(
-                    (depthmap.shape[0], depthmap.shape[1], 3),
-                    dtype=np.uint8
-                )
-
-            h, w = image.shape[:2]
-
-            # -----------------------------------------------------
-            # redimensiona depth se necessário
-            # -----------------------------------------------------
-
-            if depthmap.shape[0] != h or depthmap.shape[1] != w:
-
-                depthmap = cv2.resize(
-                    depthmap,
-                    (w, h),
-                    interpolation=cv2.INTER_NEAREST
-                )
-
-            # -----------------------------------------------------
-            # intrínseca
-            # -----------------------------------------------------
-
-            cx = w / 2.0
-            cy = h / 2.0
-
-            fx = w / (2.0 * math.tan(hFov / 2.0))
-            fy = h / (2.0 * math.tan(vFov / 2.0))
-
+            h, w = depthmap.shape[:2]
+            cx, cy = w / 2.0, h / 2.0
+            fx = w / (2.0 * math.tan(hfov_rad / 2.0))
+            fy = h / (2.0 * math.tan(vfov_rad / 2.0))
             camera_params = np.array([
                 [fx, 0, cx],
                 [0, fy, cy],
                 [0, 0, 1]
             ], dtype=np.float32)
 
-            # -----------------------------------------------------
-            # pose
-            # -----------------------------------------------------
+            # Ler pose
+            data = np.loadtxt(pose_path, delimiter=",").reshape(-1)
+            x = float(data[2])
+            y = float(data[1])
+            z = float(data[0])
+            yaw = float(data[5])
+            if is_uxo:
+                yaw = yaw - 1.57
 
-            data = np.loadtxt(
-                pose_path,
-                delimiter=","
-            ).reshape(-1)
+            if reconstruct3d_points is not None:
+                pts = reconstruct3d_points(
+                    depthmap, x, y, z, yaw, camera_params, valid_only=True
+                )
+            else:
+                if os.path.exists(rgb_path):
+                    image = cv2.imread(rgb_path)
+                    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                else:
+                    image = np.zeros((h, w, 3), dtype=np.uint8)
 
-            x = data[2]
-            y = data[1]
-            z = data[0]
-            yaw = data[5]
+                if image.shape[:2] != (h, w):
+                    image = cv2.resize(image, (w, h))
 
-            # -----------------------------------------------------
-            # reconstrução
-            # -----------------------------------------------------
-
-            _, transformed_points = reconstruct.reconstruct3d(
-                image,
-                depthmap,
-                x,
-                y,
-                z,
-                yaw,
-                camera_params,
-                step=1,
-                mesh=False
-            )
-
-            pts = np.asarray(
-                transformed_points,
-                dtype=np.float32
-            )
-
-            # remove pontos inválidos
-            valid = np.isfinite(pts).all(axis=1)
-            pts = pts[valid]
+                _, transformed_points = reconstruct3d(
+                    image, depthmap, x, y, z, yaw, camera_params, step=1, mesh=False
+                )
+                pts = np.asarray(transformed_points, dtype=np.float32)
+                valid = (depthmap > 0.0).reshape(-1)
+                pts = pts[valid]
 
             if len(pts) > 0:
-                all_points.append(pts)
+                all_valid_points.append(pts)
 
-            print(
-                f"GT depth {i}: {len(pts)} pontos"
-            )
+    if not all_valid_points:
+        print(f"[build_gt_pointcloud] Nenhum ponto válido foi reconstruído para {data_dir}")
+        return None
 
-        if not all_points:
-            raise RuntimeError(
-                "Nenhum ponto GT foi gerado."
-            )
+    gt_points = np.concatenate(all_valid_points, axis=0)
 
-        gt_points = np.concatenate(
-            all_points,
-            axis=0
-        )
+    # Rotação de alinhamento em torno do eixo X (-90 graus)
+    if apply_rotation:
+        theta = np.radians(-90.0)
+        rot_x = np.array([
+            [1.0, 0.0, 0.0],
+            [0.0, np.cos(theta), -np.sin(theta)],
+            [0.0, np.sin(theta), np.cos(theta)]
+        ], dtype=np.float32)
+        gt_points = np.dot(gt_points, rot_x.T)
 
-        print(
-            "GT point cloud:",
-            gt_points.shape
-        )
+    # Filtragem estatística de outliers
+    if filter_outliers and len(gt_points) > nb_neighbors:
+        tree = cKDTree(gt_points)
+        dists, _ = tree.query(gt_points, k=nb_neighbors + 1)
+        mean_d = np.mean(dists[:, 1:], axis=1)
+        thresh = np.mean(mean_d) + std_ratio * np.std(mean_d)
+        gt_points = gt_points[mean_d <= thresh]
 
-        return gt_points
+    gt_points = gt_points.astype(np.float32)
+    print(f"[build_gt_pointcloud] GT point cloud gerada: {gt_points.shape} pontos")
+    return gt_points
 
 def parse_pose_from_path(path):
     """
@@ -311,12 +280,26 @@ def parse_pose_from_path(path):
 
     return pose
 
-def load_sonarcloud(data_dir, max_images=None):
+def load_sonarcloud(data_dir, max_images=None, load_gt=True):
 
     print(f"\n{'=' * 70}")
     print(f"SONARCLOUD DATASET")
     print(f"Root: {data_dir}")
     print(f"{'=' * 70}")
+
+    # --------------------------------------------------
+    # GROUND TRUTH POINT CLOUD (de reconstruct_data.py)
+    # --------------------------------------------------
+    gt_points = None
+    if load_gt:
+        try:
+            gt_points = build_gt_pointcloud(data_dir)
+            if gt_points is not None:
+                print(f"[load_sonarcloud] Ground Truth carregado com sucesso: {gt_points.shape[0]} pontos.")
+            else:
+                print("[load_sonarcloud] Nenhum Ground Truth encontrado para esta pasta.")
+        except Exception as e:
+            print(f"[load_sonarcloud] Erro ao construir GT point cloud: {e}")
 
     # --------------------------------------------------
     # CALIBRAÇÃO
@@ -458,13 +441,12 @@ def load_sonarcloud(data_dir, max_images=None):
             )
             continue
 
-        images.append(
-            torch.from_numpy(img).float()
-        )
-
-        poses.append(
-            torch.from_numpy(pose).float()
-        )
+        if torch is not None:
+            images.append(torch.from_numpy(img).float())
+            poses.append(torch.from_numpy(pose).float())
+        else:
+            images.append(img)
+            poses.append(pose)
 
     print()
     print("==========================================")
@@ -473,6 +455,8 @@ def load_sonarcloud(data_dir, max_images=None):
     print(f"Dataset: {data_dir}")
     print(f"Imagens: {len(images)}")
     print(f"Poses:   {len(poses)}")
+    if gt_points is not None:
+        print(f"GT Pts:  {gt_points.shape}")
 
     for i in range(min(10, len(images))):
 
@@ -499,5 +483,6 @@ def load_sonarcloud(data_dir, max_images=None):
         "H": H,
         "W": W,
 
-        "metadata": metadata
+        "metadata": metadata,
+        "gt_points": gt_points
     }

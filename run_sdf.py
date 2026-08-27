@@ -156,6 +156,11 @@ class Runner:
             float(x) for x in self.metrics_thresholds
         ]
 
+        self.metrics_align = self.conf.get_string(
+            "metrics.align",
+            default="centroid"
+        )
+
         self.metrics_save_per_mesh = self.conf.get_bool(
             "metrics.save_per_mesh",
             default=True
@@ -346,6 +351,11 @@ class Runner:
             self.estimator = None
 
         self.gt_mesh = self.load_ground_truth_geometry()
+        self.gt_points = self.data.get("gt_points", None) if isinstance(self.data, dict) else None
+        if self.gt_points is not None:
+            logging.info(f"SonarCloud GT point cloud disponível: {self.gt_points.shape[0]} pontos.")
+        if self.gt_mesh is not None:
+            logging.info(f"GT Mesh disponível: {len(self.gt_mesh.vertices)} vértices.")
 
     def load_ground_truth_geometry(self):
         """
@@ -386,20 +396,18 @@ class Runner:
             )
             return None
         
-    def evaluate_mesh_metrics(self, mesh, mesh_path):
+    def evaluate_mesh_metrics(self, mesh, mesh_path, gt_points=None):
         """
-        Calcula métricas da mesh reconstruída.
+        Calcula métricas da mesh reconstruída contra o Ground Truth (mesh ou nuvem de pontos).
 
         Sempre calcula estatísticas da mesh.
 
-        Se self.gt_mesh existir, também calcula:
+        Se GT existir (gt_mesh ou gt_points), calcula:
         - Chamfer L1
         - Chamfer L2
-        - Accuracy
-        - Completeness
-        - Precision
-        - Recall
-        - F1
+        - Accuracy (pred -> GT)
+        - Completeness (GT -> pred)
+        - Precision, Recall, F1 para cada threshold
         """
 
         metrics = {
@@ -424,133 +432,121 @@ class Runner:
 
         # Bounds
         if len(mesh.vertices) > 0:
-
             bounds = mesh.bounds
-
             metrics["mesh_stats"]["bounds_min"] = (
                 bounds[0].astype(float).tolist()
             )
-
             metrics["mesh_stats"]["bounds_max"] = (
                 bounds[1].astype(float).tolist()
             )
 
-        # Sem GT: salva somente estatísticas
-        if self.gt_mesh is None:
-            return metrics
-
         # Mesh vazia
         if len(mesh.vertices) == 0:
-
             metrics["geometry"] = {
                 "error": "Predicted mesh has no vertices"
             }
-
             return metrics
 
-        if len(self.gt_mesh.vertices) == 0:
-
-            metrics["geometry"] = {
-                "error": "Ground truth mesh has no vertices"
-            }
-
-            return metrics
-
-        # -------------------------------------------------
-        # Amostragem de pontos nas superfícies
-        # -------------------------------------------------
-
+        # Determinar pontos GT para avaliação
+        target_gt_pts = gt_points if gt_points is not None else self.gt_points
         n_samples = self.metrics_n_samples
 
+        if self.gt_mesh is not None and len(self.gt_mesh.vertices) > 0:
+            gt_eval_points, _ = trimesh.sample.sample_surface(
+                self.gt_mesh,
+                n_samples
+            )
+        elif target_gt_pts is not None and len(target_gt_pts) > 0:
+            if len(target_gt_pts) > n_samples:
+                idx = np.random.choice(len(target_gt_pts), n_samples, replace=False)
+                gt_eval_points = target_gt_pts[idx]
+            else:
+                gt_eval_points = target_gt_pts
+        else:
+            # Sem GT: salva somente estatísticas da mesh
+            return metrics
+
+        if len(gt_eval_points) == 0:
+            metrics["geometry"] = {
+                "error": "Ground truth has no points"
+            }
+            return metrics
+
+        # -------------------------------------------------
+        # Amostragem de pontos na malha predita
+        # -------------------------------------------------
+        n_pred_samples = min(n_samples, max(1000, len(mesh.vertices)))
         pred_points, _ = trimesh.sample.sample_surface(
             mesh,
-            n_samples
+            n_pred_samples
         )
 
-        gt_points, _ = trimesh.sample.sample_surface(
-            self.gt_mesh,
-            n_samples
-        )
+        # -------------------------------------------------
+        # Alinhamento de Sistemas de Coordenadas
+        # -------------------------------------------------
+        align_mode = getattr(self, "metrics_align", "centroid").lower()
+        if align_mode in ["centroid", "center"]:
+            pred_offset = np.mean(pred_points, axis=0)
+            gt_offset = np.mean(gt_eval_points, axis=0)
+            pred_eval_pts = pred_points - pred_offset
+            gt_eval_pts = gt_eval_points - gt_offset
+            metrics["mesh_stats"]["pred_center"] = pred_offset.astype(float).tolist()
+            metrics["mesh_stats"]["gt_center"] = gt_offset.astype(float).tolist()
+        elif align_mode == "bbox_center":
+            pred_offset = (pred_points.max(axis=0) + pred_points.min(axis=0)) / 2.0
+            gt_offset = (gt_eval_points.max(axis=0) + gt_eval_points.min(axis=0)) / 2.0
+            pred_eval_pts = pred_points - pred_offset
+            gt_eval_pts = gt_eval_points - gt_offset
+            metrics["mesh_stats"]["pred_center"] = pred_offset.astype(float).tolist()
+            metrics["mesh_stats"]["gt_center"] = gt_offset.astype(float).tolist()
+        else:
+            pred_eval_pts = pred_points
+            gt_eval_pts = gt_eval_points
 
         # -------------------------------------------------
         # KD Trees
         # -------------------------------------------------
+        gt_tree = cKDTree(gt_eval_pts)
+        pred_tree = cKDTree(pred_eval_pts)
 
-        gt_tree = cKDTree(gt_points)
-        pred_tree = cKDTree(pred_points)
-
-        # GT -> Pred
-        dist_gt, idx_gt = pred_tree.query(
-            gt_points,
-            k=1
-        )
-
-        # Pred -> GT
-        dist_pred, idx_pred = gt_tree.query(
-            pred_points,
-            k=1
-)
-
-        # Para cada ponto GT:
-        # distância ao predito = completeness
-        dist_gt_to_pred, _ = pred_tree.query(
-            gt_points,
-            k=1
-        )
+        # Pred -> GT (Accuracy)
+        dist_pred_to_gt, _ = gt_tree.query(pred_eval_pts, k=1)
+        # GT -> Pred (Completeness)
+        dist_gt_to_pred, _ = pred_tree.query(gt_eval_pts, k=1)
 
         accuracy = float(np.mean(dist_pred_to_gt))
         completeness = float(np.mean(dist_gt_to_pred))
 
-        chamfer_l1 = float(
-            np.mean(dist_pred_to_gt) +
-            np.mean(dist_gt_to_pred)
-        )
-
+        chamfer_l1 = float(accuracy + completeness)
         chamfer_l2 = float(
             np.mean(dist_pred_to_gt ** 2) +
             np.mean(dist_gt_to_pred ** 2)
         )
 
         metrics["geometry"] = {
+            "alignment": align_mode,
             "accuracy": accuracy,
             "completeness": completeness,
             "chamfer_l1": chamfer_l1,
             "chamfer_l2": chamfer_l2,
+            "gt_points_count": int(len(gt_eval_points)),
+            "pred_points_count": int(len(pred_points))
         }
 
         # -------------------------------------------------
         # Precision / Recall / F1
         # -------------------------------------------------
-
         metrics["thresholds"] = {}
-
         for threshold in self.metrics_thresholds:
-
-            precision = float(
-                np.mean(
-                    dist_pred_to_gt < threshold
-                )
-            )
-
-            recall = float(
-                np.mean(
-                    dist_gt_to_pred < threshold
-                )
-            )
+            precision = float(np.mean(dist_pred_to_gt < threshold))
+            recall = float(np.mean(dist_gt_to_pred < threshold))
 
             if precision + recall > 0:
-
-                f1 = float(
-                    2.0 * precision * recall /
-                    (precision + recall)
-                )
-
+                f1 = float(2.0 * precision * recall / (precision + recall))
             else:
-
                 f1 = 0.0
 
             threshold_key = f"{threshold:.6f}"
-
             metrics["thresholds"][threshold_key] = {
                 "precision": precision,
                 "recall": recall,
@@ -1149,88 +1145,12 @@ class Runner:
         else:
             return np.min([1.0, self.iter_step / self.anneal_end])
     
-    def evaluate_mesh_metrics(
-        self,
-        mesh,
-        mesh_path
-    ):
-        """
-        Compara a malha reconstruída contra o GT
-        obtido dos depth maps.
-        """
-
-        print("=" * 60)
-        print("Calculando métricas...")
-        print("=" * 60)
-
-        # ---------------------------------------------------------
-        # GT
-        # ---------------------------------------------------------
-
-        gt_points = self.build_gt_pointcloud()
-
-        print("================================")
-        print("GT STATS")
-        print("================================")
-        print("shape:", gt_points.shape)
-        print("min:", gt_points.min(axis=0))
-        print("max:", gt_points.max(axis=0))
-        print("mean:", gt_points.mean(axis=0))
-
-        # ---------------------------------------------------------
-        # pontos da malha
-        # ---------------------------------------------------------
-
-        # amostragem da superfície
-        n_samples = min(
-            100000,
-            max(10000, len(gt_points))
-        )
-
-        pred_points, pred_face_idx = trimesh.sample.sample_surface(
-            mesh,
-            n_samples
-        )
-
-        pred_points = np.asarray(
-            pred_points,
-            dtype=np.float32
-        )
-
-        # ---------------------------------------------------------
-        # nearest neighbor
-        # ---------------------------------------------------------
-
-        gt_cloud = trimesh.PointCloud(gt_points)
-        pred_cloud = trimesh.PointCloud(pred_points)
-
-        # distância GT -> reconstrução
-        closest_gt, dist_gt, _ = trimesh.proximity.closest_point(
-            mesh,
-            gt_points
-        )
-
-        dist_gt = np.abs(dist_gt)
-
-        # reconstrução -> GT
-        closest_pred, dist_pred, _ = trimesh.proximity.closest_point(
-            trimesh.Trimesh(
-                vertices=gt_points,
-                faces=[]
-            ),
-            pred_points
-        )
-
-        dist_pred = np.abs(dist_pred)
-
-        
     def validate_mesh(
         self,
         world_space=False,
         resolution=None,
         threshold=0.0
     ):
-
         if resolution is None:
             resolution = self.mesh_resolution
 
@@ -1257,11 +1177,9 @@ class Runner:
         )
 
         self.renderer.sdf_network = self.sdf_network
-
         self.renderer.deviation_network = (
             self.deviation_network
         )
-
         self.renderer.color_network = (
             self.color_network
         )
@@ -1286,7 +1204,6 @@ class Runner:
         )
 
         if world_space:
-
             vertices = (
                 vertices *
                 self.dataset.scale_mats_np[0][0, 0]
@@ -1308,17 +1225,32 @@ class Runner:
         mesh.export(mesh_path)
 
         # -----------------------------------------
-        # NEW: avaliar e salvar métricas
+        # Avaliar e salvar métricas de reconstrução
         # -----------------------------------------
-
-        gt_points, gt_normals = self.load_sonarcloud_gt()
-
         metrics = self.evaluate_mesh_metrics(
             mesh,
             mesh_path,
-            gt_points=gt_points,
-            gt_normals=gt_normals
+            gt_points=self.gt_points
         )
+
+        self.save_mesh_metrics(metrics)
+
+        if "geometry" in metrics and "chamfer_l1" in metrics["geometry"]:
+            geom = metrics["geometry"]
+            tqdm.write(
+                f"\n[VALIDAÇÃO iter {self.iter_step}] Chamfer L1: {geom['chamfer_l1']:.4f} | "
+                f"Accuracy: {geom['accuracy']:.4f} | Completeness: {geom['completeness']:.4f}"
+            )
+            if self.use_wandb:
+                wandb_metrics = {
+                    "val_mesh/chamfer_l1": geom["chamfer_l1"],
+                    "val_mesh/chamfer_l2": geom["chamfer_l2"],
+                    "val_mesh/accuracy": geom["accuracy"],
+                    "val_mesh/completeness": geom["completeness"],
+                }
+                for thresh_k, vals in metrics.get("thresholds", {}).items():
+                    wandb_metrics[f"val_mesh/f1_{thresh_k}"] = vals["f1"]
+                wandb.log(wandb_metrics)
 
         return mesh_path
 
