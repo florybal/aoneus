@@ -19,7 +19,16 @@ def extract_fields(bound_min, bound_max, resolution, query_func):
     Z = torch.linspace(bound_min[2], bound_max[2], resolution, device=device)
     xs, ys, zs = torch.meshgrid(X, Y, Z, indexing='ij')
     pts = torch.stack([xs.reshape(-1), ys.reshape(-1), zs.reshape(-1)], dim=-1)
-    val = query_func(pts).reshape(resolution, resolution, resolution).detach().cpu().numpy()
+
+    # Processa em batches para evitar OOM
+    batch_size = N * N * N  # 262144 pontos por batch
+    vals = []
+    for i in range(0, pts.shape[0], batch_size):
+        batch = pts[i:i + batch_size]
+        val = query_func(batch).detach().cpu()
+        vals.append(val)
+        torch.cuda.empty_cache()
+    val = torch.cat(vals, dim=0).reshape(resolution, resolution, resolution).numpy()
     return val
  
 def extract_geometry(bound_min, bound_max, resolution, threshold, query_func=lambda pts: -self.sdf_network.sdf(pts.to(self.sdf_network.lin0.weight.device))):

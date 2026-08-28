@@ -169,7 +169,32 @@ class RenderingNetwork(nn.Module):
         else:
             self.embedview_fn = None
 
-        self.linears = None
+        # Inicialização eager (não lazy) para que o state_dict tenha
+        # 'linears.*' desde o início e seja possível carregar checkpoints
+        # que esperam essa estrutura.
+        # A entrada concatenada em forward() é:
+        #   points (passa por embed_fn) + view_dirs (passa por embedview_fn) + normals (passa por embedview_fn) + feature_vectors
+        # d_in é o tamanho "bruto" (points+view_dirs+normals concatenados sem embedding extra).
+        # Para o config usado (multires=0, multires_view=4):
+        #   d_in (9) + view_dirs embedded (3 + 3*2*4 = 27) + normals embedded (27) + d_feature (64) = 127
+        d_feature = kwargs.get('d_feature', 0)
+        input_dim = d_in
+        if self.embedview_fn is not None:
+            # view_dirs embedded: 3 + 3*2*multires
+            # Quando embedview_fn existe, view_dirs e normals passam por ele,
+            # mas como d_in já inclui os 3 brutos de view_dirs e normals,
+            # só precisamos adicionar a parte extra do embedding.
+            extra_per = 3 * 2 * multires_view  # 3*2*4 = 24 para multires_view=4
+            input_dim += extra_per * 2  # view_dirs + normals
+        # feature_vectors
+        input_dim += d_feature
+        dims = [input_dim] + [d_hidden] * n_layers + [d_out]
+        self.linears = nn.ModuleList()
+        for i in range(len(dims) - 1):
+            lin = nn.Linear(dims[i], dims[i + 1])
+            nn.init.xavier_uniform_(lin.weight)
+            nn.init.zeros_(lin.bias)
+            self.linears.append(lin)
 
     def forward(self, points, normals=None, view_dirs=None, feature_vectors=None):
         if self.embed_fn is not None:

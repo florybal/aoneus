@@ -1117,7 +1117,8 @@ class Runner:
 
     def load_checkpoint(self, checkpoint_name):
         # checkpoint = torch.load(os.path.join(self.base_exp_dir, 'checkpoints', checkpoint_name), map_location=self.device)
-        checkpoint = torch.load(checkpoint_name, map_location=self.device)
+        checkpoint = torch.load(checkpoint_name, map_location=self.device, weights_only=False)
+
         # Depois de carregar, force movimento
         self.sdf_network.load_state_dict(checkpoint['sdf_network_fine'])
         self.sdf_network = self.sdf_network.to(self.device)
@@ -1125,7 +1126,16 @@ class Runner:
         self.sdf_network.load_state_dict(checkpoint['sdf_network_fine'])
         self.deviation_network.load_state_dict(checkpoint['variance_network_fine'])
         self.color_network.load_state_dict(checkpoint['color_network_fine'])
-        self.optimizer.load_state_dict(checkpoint['optimizer'])
+
+        # Tenta carregar optimizer state; se falhar (parameter groups mudaram),
+        # reinicia o optimizer mantendo os pesos dos modelos.
+        try:
+            self.optimizer.load_state_dict(checkpoint['optimizer'])
+        except ValueError as e:
+            print(f'[load_checkpoint] Falha ao carregar optimizer state ({e}); reiniciando optimizer.')
+            self.iter_step = 0
+            return
+
         self.iter_step = checkpoint['iter_step']
 
     def update_learning_rate(self):
