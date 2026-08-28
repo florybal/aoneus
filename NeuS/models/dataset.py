@@ -72,10 +72,12 @@ class Dataset:
     def __init__(self, conf):
         super(Dataset, self).__init__()
         print("Load data: Begin")
+        print(f"DEBUG: conf keys = {conf.keys()}")
         self.device = get_preferred_device()
         self.conf = conf
 
         self.data_dir = conf.get_string("data_dir")
+        print(f"DEBUG: data_dir = {self.data_dir}")
         self.camera_outside_sphere = conf.get_bool(
             "camera_outside_sphere", default=True
         )

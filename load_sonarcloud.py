@@ -221,9 +221,13 @@ def parse_pose_from_path(path):
             )
 
         elif p.startswith("orientation_"):
-            orientation_idx = int(
-                p.replace("orientation_", "")
-            )
+            try:
+                # Tenta extrair o índice mesmo se o nome do arquivo/pasta tiver sufixos
+                orientation_idx = int(p.split("_")[1])
+            except:
+                orientation_idx = int(
+                    p.replace("orientation_", "")
+                )
         
         elif p.startswith("rot"):
             try:
