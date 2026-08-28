@@ -106,9 +106,12 @@ class Dataset:
             np.stack([cv.imread(im_name) for im_name in self.images_lis]) / 256.0
         )
         self.masks_lis = sorted(glob(os.path.join(self.data_dir, "mask/*.png")))
-        self.masks_np = (
-            np.stack([cv.imread(im_name) for im_name in self.masks_lis]) / 256.0
-        )
+        if len(self.masks_lis) > 0:
+            self.masks_np = (
+                np.stack([cv.imread(im_name) for im_name in self.masks_lis]) / 256.0
+            )
+        else:
+            self.masks_np = np.ones_like(self.images_np)
 
         # world_mat is a projection matrix from world to image
         self.world_mats_np = [
